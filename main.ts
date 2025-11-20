@@ -1,14 +1,18 @@
-import { moment, SuggestModal, TFile } from 'obsidian';
+import { AbstractInputSuggest, moment, SuggestModal, TFile, TFolder } from 'obsidian';
 import { App, Plugin, PluginSettingTab, requestUrl, Setting } from 'obsidian';
 
 interface IGDBSyncSettings {
 	clientId: string;
 	secret: string;
+	gameNoteFolder: string;
+	gameFileTemplate: string;
 }
 
 const DEFAULT_SETTINGS: IGDBSyncSettings = {
 	clientId: "",
-	secret: ""
+	secret: "",
+	gameNoteFolder: "",
+	gameFileTemplate: ""
 }
 
 interface IGDBTokenResponse {
@@ -95,10 +99,44 @@ export default class IGDBSync extends Plugin {
 		});
 
 		this.addCommand({
-			id: 'search-igdb-game',
+			id: 'search-igdb-game-current-file',
 			name: 'Search and add IGDB ID to current file',
+			editorCheckCallback: (checking, _, view) => {
+				const file = view.file;
+				if (file?.extension == "md") {
+					if (!checking) {
+						new GameSearchModal(this.app, this, result => {
+							this.app.fileManager.processFrontMatter(file, fm => {
+								fm["igdb"] = result.id;
+							}).then(() => {
+								this.refreshIGDBNote(file, result.id);
+							});
+						}).open();
+					}
+					return true;
+				}
+			}
+		})
+
+		this.addCommand({
+			id: 'search-igdb-game-new-file',
+			name: 'Search and create game file from IGDB info',
 			callback: () => {
-				new GameSearchModal(this.app, this).open();
+				new GameSearchModal(this.app, this, async result => {
+					const sanitizedTitle = result.name.replace(/[/\\?%*:|"<>]/g, '-');
+					let newFileContent = "";
+					if (this.settings.gameFileTemplate) {
+						newFileContent = await this.app.vault.cachedRead(this.app.vault.getAbstractFileByPath(this.settings.gameFileTemplate) as TFile)
+					}
+					this.app.vault.create(`${this.settings.gameNoteFolder}/${sanitizedTitle}.md`, newFileContent).then(activeFile => {
+						this.app.fileManager.processFrontMatter(activeFile, fm => {
+							fm["igdb"] = result.id;
+						}).then(() => {
+							this.app.workspace.getLeaf().openFile(activeFile);
+							this.refreshIGDBNote(activeFile, result.id);
+						});
+					});
+				}).open();
 			}
 		})
 
@@ -159,7 +197,7 @@ interface GameResult {
 }
 
 class GameSearchModal extends SuggestModal<GameResult> {
-	constructor(app: App, private plugin: IGDBSync) {
+	constructor(app: App, private plugin: IGDBSync, private callback: (result: GameResult) => void) {
 		super(app);
 	}
 	// Returns all available suggestions.
@@ -179,23 +217,55 @@ class GameSearchModal extends SuggestModal<GameResult> {
 
 	// Perform action on the selected suggestion.
 	onChooseSuggestion(game: GameResult, evt: MouseEvent | KeyboardEvent) {
-		const activeFile = this.app.workspace.getActiveFile();
-		if (activeFile) {
-			this.app.fileManager.processFrontMatter(activeFile, fm => {
-				fm["igdb"] = game.id;
-			}).then(() => {
-				this.plugin.refreshIGDBNote(activeFile, game.id);
-			});
-		}
+		this.callback(game);
+	}
+}
+
+class FolderSuggest extends AbstractInputSuggest<TFolder> {
+	constructor(app: App, private inputEl: HTMLInputElement, private plugin: IGDBSync) {
+		super(app, inputEl);
+	}
+
+	protected getSuggestions(query: string): TFolder[] {
+		return this.app.vault.getAllFolders().filter(f => f.path.toLowerCase().contains(query.toLowerCase()));
+	}
+
+	public renderSuggestion(value: TFolder, el: HTMLElement): void {
+		el.createEl('div', { text: value.path });
+	}
+
+	public selectSuggestion(value: TFolder): void {
+		this.inputEl.value = value.path;
+		this.plugin.settings.gameNoteFolder = value.path
+		this.plugin.saveSettings();
+		this.close();
+	}
+}
+
+class FileSuggest extends AbstractInputSuggest<TFile> {
+	constructor(app: App, private inputEl: HTMLInputElement, private plugin: IGDBSync) {
+		super(app, inputEl);
+	}
+
+	protected getSuggestions(query: string): TFile[] {
+		return this.app.vault.getMarkdownFiles().filter(f => f.path.toLowerCase().contains(query.toLowerCase()));
+	}
+
+	public renderSuggestion(value: TFile, el: HTMLElement): void {
+		el.createEl('div', { text: value.path });
+	}
+
+	public selectSuggestion(value: TFile): void {
+		this.inputEl.value = value.path;
+		this.plugin.settings.gameFileTemplate = value.path
+		this.plugin.saveSettings();
+		this.close();
 	}
 }
 
 class IGDBSyncSettingsTab extends PluginSettingTab {
-	plugin: IGDBSync;
-
-	constructor(app: App, plugin: IGDBSync) {
+	constructor(app: App, private plugin: IGDBSync) {
 		super(app, plugin);
-		this.plugin = plugin;
 	}
 
 	display(): void {
@@ -222,5 +292,31 @@ class IGDBSyncSettingsTab extends PluginSettingTab {
 					this.plugin.settings.secret = value;
 					await this.plugin.saveSettings();
 				}));
+
+		new Setting(containerEl)
+			.setName('Game Note Folder')
+			.addSearch(search => {
+				search.setValue(this.plugin.settings.gameNoteFolder)
+					.setPlaceholder('Select folder to store generated game notes')
+					.onChange(async (value) => {
+						console.log(value)
+						this.plugin.settings.gameNoteFolder = value;
+						await this.plugin.saveSettings();
+					});
+				new FolderSuggest(this.app, search.inputEl, this.plugin);
+			});
+
+		new Setting(containerEl)
+			.setName('Game Note Template')
+			.setDesc('Template for new game notes.')
+			.addSearch(search => {
+				search.setValue(this.plugin.settings.gameFileTemplate)
+					.setPlaceholder('Select template for new game notes')
+					.onChange(async (value) => {
+						this.plugin.settings.gameFileTemplate = value;
+						await this.plugin.saveSettings();
+					});
+				new FileSuggest(this.app, search.inputEl, this.plugin);
+			});
 	}
 }
