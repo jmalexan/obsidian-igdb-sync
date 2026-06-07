@@ -38,46 +38,46 @@ async function refreshIGDBToken(clientId: string, secret: string): Promise<IGDBT
 	return response.json as IGDBTokenResponse;
 }
 
-async function fetchIGDBGameReleaseDate(token: string, clientId: string, gameId: number): Promise<string | null> {
-	const response = await requestUrl({
-		url: "https://api.igdb.com/v4/release_dates",
-		method: "POST",
-		headers: {
-			"Client-ID": clientId,
-			"Authorization": `Bearer ${token}`,
-		},
-		body: `fields *; where game = ${gameId} & release_region = (8,2);`,
-	});
-
-	const data = response.json as any[];
-	const pcRelease = data.find(rd => rd.platform === 6);
-	const date = pcRelease ? pcRelease.date : data.first()?.date
-	if (!date) {
-		return null;
-	}
-	return moment.utc(date * 1000).format("YYYY-MM-DD");
+interface IGDBGameInfo {
+	releaseDate: string | null;
+	storeLink: string | null;
 }
 
-async function fetchIGDBGameStoreLink(token: string, clientId: string, gameId: number): Promise<string | null> {
+async function fetchIGDBGameInfo(token: string, clientId: string, gameId: number): Promise<IGDBGameInfo> {
 	const response = await requestUrl({
-		url: "https://api.igdb.com/v4/websites",
+		url: "https://api.igdb.com/v4/games",
 		method: "POST",
 		headers: {
 			"Client-ID": clientId,
 			"Authorization": `Bearer ${token}`,
 		},
-		body: `fields url,type; where game = ${gameId} & type = (13,24,23);`,
+		body: `fields release_dates.date,release_dates.platform,release_dates.release_region,websites.url,websites.type; where id = ${gameId};`,
 	});
 
-	const data = response.json as any[];
+	const game = (response.json as any[])[0];
+	if (!game) {
+		return { releaseDate: null, storeLink: null };
+	}
+
+	const releases = (game.release_dates ?? []).filter((rd: any) =>
+		rd.release_region === 8 || rd.release_region === 2
+	);
+	const pcRelease = releases.find((rd: any) => rd.platform === 6);
+	const dateUnix = pcRelease ? pcRelease.date : releases[0]?.date;
+	const releaseDate = dateUnix ? moment.utc(dateUnix * 1000).format("YYYY-MM-DD") : null;
+
+	const websites = game.websites ?? [];
 	const priority = [13, 24, 23]; // Steam, Nintendo/Switch, PlayStation
+	let storeLink: string | null = null;
 	for (const type of priority) {
-		const match = data.find(w => w.type === type);
+		const match = websites.find((w: any) => w.type === type);
 		if (match) {
-			return match.url;
+			storeLink = match.url;
+			break;
 		}
 	}
-	return null;
+
+	return { releaseDate, storeLink };
 }
 
 async function searchIGDBGames(token: string, clientId: string, query: string): Promise<GameResult[]> {
@@ -102,6 +102,7 @@ async function searchIGDBGames(token: string, clientId: string, query: string): 
 export default class IGDBSync extends Plugin {
 	settings: IGDBSyncSettings
 	token: string | null;
+	private syncing = false;
 
 	async onload() {
 		await this.loadSettings();
@@ -191,22 +192,27 @@ export default class IGDBSync extends Plugin {
 	}
 
 	async refreshAllIGDBNotes() {
-		for (const file of this.app.vault.getMarkdownFiles()) {
-			const fm = this.app.metadataCache.getFileCache(file)?.frontmatter ?? {};
-			const igdb = fm?.["igdb"]
-			if (igdb) {
-				await this.refreshIGDBNote(file, igdb);
+		if (this.syncing) return;
+		this.syncing = true;
+		try {
+			for (const file of this.app.vault.getMarkdownFiles()) {
+				const fm = this.app.metadataCache.getFileCache(file)?.frontmatter ?? {};
+				const igdb = fm?.["igdb"]
+				if (igdb) {
+					await this.refreshIGDBNote(file, igdb);
+				}
 			}
+		} finally {
+			this.syncing = false;
 		}
 	}
 
 	async refreshIGDBNote(file: TFile, igdb: number) {
 		const token = this.token;
 		if (token) {
-			const date = await fetchIGDBGameReleaseDate(token, this.settings.clientId, igdb)
-			const storeLink = await fetchIGDBGameStoreLink(token, this.settings.clientId, igdb)
+			const { releaseDate, storeLink } = await fetchIGDBGameInfo(token, this.settings.clientId, igdb)
 			this.app.fileManager.processFrontMatter(file, fm => {
-				fm["release_date"] = date ?? "TBD"
+				fm["release_date"] = releaseDate ?? "TBD"
 				if (storeLink != null) {
 					fm["store_link"] = storeLink
 				}
