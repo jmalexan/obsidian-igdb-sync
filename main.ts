@@ -16,6 +16,8 @@ const WEBSITE_PLAYSTATION = 23;
 const WEBSITE_NINTENDO = 24;
 const STORE_PRIORITY = [WEBSITE_STEAM, WEBSITE_NINTENDO, WEBSITE_PLAYSTATION];
 
+const STEAM_APP_ID_RE = /\/app\/(\d+)/;
+
 const COVER_SIZE = "t_cover_big";
 const IGDB_GAMES_FIELDS = "release_dates.date,release_dates.platform,release_dates.release_region,websites.url,websites.type,cover.image_id,platforms";
 const IGDB_CHUNK_SIZE = 100;
@@ -83,6 +85,7 @@ interface IGDBSearchHit {
 interface IGDBNoteData {
 	releaseDate: string | null;
 	storeLink: string | null;
+	steamLaunch: string | null;
 	coverUrl: string | null;
 	platforms: string[];
 }
@@ -170,6 +173,10 @@ function extractIGDBNoteData(game: IGDBGame): IGDBNoteData {
 		if (match) { storeLink = match.url; break; }
 	}
 
+	const steamSite = websites.find(w => w.type === WEBSITE_STEAM);
+	const steamAppIdMatch = steamSite?.url.match(STEAM_APP_ID_RE);
+	const steamLaunch = steamAppIdMatch ? `steam://rungameid/${steamAppIdMatch[1]}` : null;
+
 	const coverUrl = game.cover?.image_id
 		? `https://images.igdb.com/igdb/image/upload/${COVER_SIZE}/${game.cover.image_id}.jpg`
 		: null;
@@ -180,7 +187,7 @@ function extractIGDBNoteData(game: IGDBGame): IGDBNoteData {
 	if (platformIds.has(PLATFORM_SWITCH)) platforms.push("Switch");
 	if (PLATFORM_PLAYSTATION_IDS.some(id => platformIds.has(id))) platforms.push("PlayStation");
 
-	return { releaseDate, storeLink, coverUrl, platforms };
+	return { releaseDate, storeLink, steamLaunch, coverUrl, platforms };
 }
 
 export default class IGDBSync extends Plugin {
@@ -378,6 +385,7 @@ export default class IGDBSync extends Plugin {
 		await this.app.fileManager.processFrontMatter(file, fm => {
 			fm["release_date"] = data.releaseDate ?? "TBD";
 			if (data.storeLink != null) fm["store_link"] = data.storeLink;
+			if (data.steamLaunch != null) fm["steam_launch"] = data.steamLaunch;
 			if (data.coverUrl != null) fm["cover_url"] = data.coverUrl;
 			if (data.platforms.length > 0) fm["platforms"] = data.platforms;
 		});
