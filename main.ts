@@ -175,7 +175,7 @@ function extractIGDBNoteData(game: IGDBGame): IGDBNoteData {
 
 	const steamSite = websites.find(w => w.type === WEBSITE_STEAM);
 	const steamAppIdMatch = steamSite?.url.match(STEAM_APP_ID_RE);
-	const steamLaunch = steamAppIdMatch ? `[Play](steam://rungameid/${steamAppIdMatch[1]})` : null;
+	const steamLaunch = steamAppIdMatch ? `steam://rungameid/${steamAppIdMatch[1]}` : null;
 
 	const coverUrl = game.cover?.image_id
 		? `https://images.igdb.com/igdb/image/upload/${COVER_SIZE}/${game.cover.image_id}.jpg`
