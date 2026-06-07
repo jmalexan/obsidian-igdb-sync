@@ -1,7 +1,7 @@
 {
 	"id": "igdb-sync",
 	"name": "IGDB Sync",
-	"version": "1.1.0",
+	"version": "2.0.0",
 	"minAppVersion": "0.15.0",
 	"description": "Sync note properties with metadata from IGDB (Internet Game Database).",
 	"author": "Jonathan Alexander",
