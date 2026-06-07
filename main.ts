@@ -58,6 +58,28 @@ async function fetchIGDBGameReleaseDate(token: string, clientId: string, gameId:
 	return moment.utc(date * 1000).format("YYYY-MM-DD");
 }
 
+async function fetchIGDBGameStoreLink(token: string, clientId: string, gameId: number): Promise<string | null> {
+	const response = await requestUrl({
+		url: "https://api.igdb.com/v4/websites",
+		method: "POST",
+		headers: {
+			"Client-ID": clientId,
+			"Authorization": `Bearer ${token}`,
+		},
+		body: `fields url,type; where game = ${gameId} & type = (13,24,23);`,
+	});
+
+	const data = response.json as any[];
+	const priority = [13, 24, 23]; // Steam, Nintendo/Switch, PlayStation
+	for (const type of priority) {
+		const match = data.find(w => w.type === type);
+		if (match) {
+			return match.url;
+		}
+	}
+	return null;
+}
+
 async function searchIGDBGames(token: string, clientId: string, query: string): Promise<GameResult[]> {
 	const response = await requestUrl({
 		url: "https://api.igdb.com/v4/games",
@@ -182,8 +204,12 @@ export default class IGDBSync extends Plugin {
 		const token = this.token;
 		if (token) {
 			const date = await fetchIGDBGameReleaseDate(token, this.settings.clientId, igdb)
+			const storeLink = await fetchIGDBGameStoreLink(token, this.settings.clientId, igdb)
 			this.app.fileManager.processFrontMatter(file, fm => {
 				fm["release_date"] = date ?? "TBD"
+				if (storeLink != null) {
+					fm["store_link"] = storeLink
+				}
 			})
 		}
 	}
