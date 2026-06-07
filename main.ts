@@ -66,14 +66,14 @@ async function searchIGDBGames(token: string, clientId: string, query: string): 
 			"Client-ID": clientId,
 			"Authorization": `Bearer ${token}`,
 		},
-		body: `search "${query}"; fields name,involved_companies.company.name,first_release_date; limit 10; where involved_companies.developer = true;`,
+		body: `search "${query}"; fields name,id,involved_companies.company.name,first_release_date; limit 10; where involved_companies.developer = true;`,
 	});
 
-	return (response.json as any[]).map<GameResult>((game: any) => ({
-		id: game.id,
-		name: game.name,
-		developer: game.involved_companies.reduce((dev: string, ic: any, i: number) => dev + (i == 0 ? "" : ", ") + ic.company.name, ""),
-		year: game?.first_release_date ? moment.utc(game.first_release_date * 1000).format("YYYY") : "N/A"
+	return (response.json as any[]).map<GameResult>((result: any) => ({
+		id: result.id,
+		name: result.name,
+		developer: result.involved_companies.reduce((dev: string, ic: any, i: number) => dev + (i == 0 ? "" : ", ") + ic.company.name, ""),
+		year: result?.first_release_date ? moment.utc(result.first_release_date * 1000).format("YYYY") : "N/A"
 	}));
 }
 
