@@ -1,5 +1,29 @@
-import { AbstractInputSuggest, moment, SuggestModal, TFile, TFolder } from 'obsidian';
+import { AbstractInputSuggest, moment, Notice, SuggestModal, TFile, TFolder } from 'obsidian';
 import { App, Plugin, PluginSettingTab, requestUrl, Setting } from 'obsidian';
+
+const PLUGIN_NAME = "IGDB Sync";
+
+const PLATFORM_PC = 6;
+const PLATFORM_SWITCH = 130;
+const PLATFORM_PLAYSTATION_IDS = [7, 8, 9, 38, 46, 48, 167];
+
+const REGION_NORTH_AMERICA = 2;
+const REGION_WORLDWIDE = 8;
+const SYNC_REGIONS = [REGION_NORTH_AMERICA, REGION_WORLDWIDE];
+
+const WEBSITE_STEAM = 13;
+const WEBSITE_PLAYSTATION = 23;
+const WEBSITE_NINTENDO = 24;
+const STORE_PRIORITY = [WEBSITE_STEAM, WEBSITE_NINTENDO, WEBSITE_PLAYSTATION];
+
+const COVER_SIZE = "t_cover_big";
+const IGDB_GAMES_FIELDS = "release_dates.date,release_dates.platform,release_dates.release_region,websites.url,websites.type,cover.image_id,platforms";
+const IGDB_CHUNK_SIZE = 100;
+const TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000;
+const SEARCH_DEBOUNCE_MS = 300;
+
+const TOKEN_KEY = "igdb_token";
+const TOKEN_EXPIRY_KEY = "igdb_token_expiry";
 
 interface IGDBSyncSettings {
 	clientId: string;
@@ -21,7 +45,56 @@ interface IGDBTokenResponse {
 	token_type: string;
 }
 
-async function refreshIGDBToken(clientId: string, secret: string): Promise<IGDBTokenResponse> {
+interface IGDBReleaseDate {
+	date?: number;
+	platform?: number;
+	release_region?: number;
+}
+
+interface IGDBWebsite {
+	url: string;
+	type: number;
+}
+
+interface IGDBCover {
+	image_id?: string;
+}
+
+interface IGDBInvolvedCompany {
+	company: { name: string };
+	developer?: boolean;
+}
+
+interface IGDBGame {
+	id: number;
+	release_dates?: IGDBReleaseDate[];
+	websites?: IGDBWebsite[];
+	cover?: IGDBCover;
+	platforms?: number[];
+}
+
+interface IGDBSearchHit {
+	id: number;
+	name: string;
+	involved_companies?: IGDBInvolvedCompany[];
+	first_release_date?: number;
+}
+
+interface IGDBNoteData {
+	releaseDate: string | null;
+	storeLink: string | null;
+	coverUrl: string | null;
+	platforms: string[];
+}
+
+class IGDBAuthError extends Error {
+	constructor() {
+		super("IGDB authentication failed (401)");
+		this.name = "IGDBAuthError";
+	}
+}
+
+async function fetchIGDBToken(clientId: string, secret: string): Promise<IGDBTokenResponse> {
 	const response = await requestUrl({
 		url: "https://id.twitch.tv/oauth2/token",
 		method: "POST",
@@ -38,76 +111,89 @@ async function refreshIGDBToken(clientId: string, secret: string): Promise<IGDBT
 	return response.json as IGDBTokenResponse;
 }
 
-interface IGDBGameInfo {
-	releaseDate: string | null;
-	storeLink: string | null;
-}
-
-async function fetchIGDBGameInfo(token: string, clientId: string, gameId: number): Promise<IGDBGameInfo> {
+async function igdbPost<T>(token: string, clientId: string, endpoint: string, body: string): Promise<T> {
 	const response = await requestUrl({
-		url: "https://api.igdb.com/v4/games",
+		url: `https://api.igdb.com/v4/${endpoint}`,
 		method: "POST",
 		headers: {
 			"Client-ID": clientId,
 			"Authorization": `Bearer ${token}`,
 		},
-		body: `fields release_dates.date,release_dates.platform,release_dates.release_region,websites.url,websites.type; where id = ${gameId};`,
+		body,
+		throw: false,
 	});
-
-	const game = (response.json as any[])[0];
-	if (!game) {
-		return { releaseDate: null, storeLink: null };
+	if (response.status === 401) throw new IGDBAuthError();
+	if (response.status >= 400) {
+		throw new Error(`IGDB API ${response.status}: ${response.text ?? ""}`);
 	}
+	return response.json as T;
+}
 
-	const releases = (game.release_dates ?? []).filter((rd: any) =>
-		rd.release_region === 8 || rd.release_region === 2
-	);
-	const pcRelease = releases.find((rd: any) => rd.platform === 6);
-	const dateUnix = pcRelease ? pcRelease.date : releases[0]?.date;
-	const releaseDate = dateUnix ? moment.utc(dateUnix * 1000).format("YYYY-MM-DD") : null;
-
-	const websites = game.websites ?? [];
-	const priority = [13, 24, 23]; // Steam, Nintendo/Switch, PlayStation
-	let storeLink: string | null = null;
-	for (const type of priority) {
-		const match = websites.find((w: any) => w.type === type);
-		if (match) {
-			storeLink = match.url;
-			break;
-		}
+async function fetchIGDBGames(token: string, clientId: string, ids: number[]): Promise<IGDBGame[]> {
+	if (ids.length === 0) return [];
+	const results: IGDBGame[] = [];
+	for (let i = 0; i < ids.length; i += IGDB_CHUNK_SIZE) {
+		const chunk = ids.slice(i, i + IGDB_CHUNK_SIZE);
+		const body = `fields ${IGDB_GAMES_FIELDS}; where id = (${chunk.join(",")}); limit ${chunk.length};`;
+		const games = await igdbPost<IGDBGame[]>(token, clientId, "games", body);
+		results.push(...games);
 	}
-
-	return { releaseDate, storeLink };
+	return results;
 }
 
 async function searchIGDBGames(token: string, clientId: string, query: string): Promise<GameResult[]> {
-	const response = await requestUrl({
-		url: "https://api.igdb.com/v4/games",
-		method: "POST",
-		headers: {
-			"Client-ID": clientId,
-			"Authorization": `Bearer ${token}`,
-		},
-		body: `search "${query}"; fields name,id,involved_companies.company.name,first_release_date; limit 10; where involved_companies.developer = true;`,
-	});
-
-	return (response.json as any[]).map<GameResult>((result: any) => ({
-		id: result.id,
-		name: result.name,
-		developer: result.involved_companies.reduce((dev: string, ic: any, i: number) => dev + (i == 0 ? "" : ", ") + ic.company.name, ""),
-		year: result?.first_release_date ? moment.utc(result.first_release_date * 1000).format("YYYY") : "N/A"
+	const body = `search "${query}"; fields name,id,involved_companies.company.name,first_release_date; limit 10; where involved_companies.developer = true;`;
+	const hits = await igdbPost<IGDBSearchHit[]>(token, clientId, "games", body);
+	return hits.map<GameResult>((hit) => ({
+		id: hit.id,
+		name: hit.name,
+		developer: (hit.involved_companies ?? []).reduce(
+			(dev, ic, i) => dev + (i == 0 ? "" : ", ") + ic.company.name,
+			""
+		),
+		year: hit.first_release_date ? moment.utc(hit.first_release_date * 1000).format("YYYY") : "N/A"
 	}));
+}
+
+function extractIGDBNoteData(game: IGDBGame): IGDBNoteData {
+	const releases = (game.release_dates ?? []).filter(rd =>
+		rd.release_region !== undefined && SYNC_REGIONS.includes(rd.release_region)
+	);
+	const pcRelease = releases.find(rd => rd.platform === PLATFORM_PC);
+	const dateUnix = pcRelease?.date ?? releases[0]?.date;
+	const releaseDate = dateUnix ? moment.utc(dateUnix * 1000).format("YYYY-MM-DD") : null;
+
+	const websites = game.websites ?? [];
+	let storeLink: string | null = null;
+	for (const type of STORE_PRIORITY) {
+		const match = websites.find(w => w.type === type);
+		if (match) { storeLink = match.url; break; }
+	}
+
+	const coverUrl = game.cover?.image_id
+		? `https://images.igdb.com/igdb/image/upload/${COVER_SIZE}/${game.cover.image_id}.jpg`
+		: null;
+
+	const platformIds = new Set(game.platforms ?? []);
+	const platforms: string[] = [];
+	if (platformIds.has(PLATFORM_PC)) platforms.push("PC");
+	if (platformIds.has(PLATFORM_SWITCH)) platforms.push("Switch");
+	if (PLATFORM_PLAYSTATION_IDS.some(id => platformIds.has(id))) platforms.push("PlayStation");
+
+	return { releaseDate, storeLink, coverUrl, platforms };
 }
 
 export default class IGDBSync extends Plugin {
 	settings: IGDBSyncSettings
 	token: string | null;
+	private tokenExpiry = 0;
 	private syncing = false;
 
 	async onload() {
 		await this.loadSettings();
-		this.token = this.app.loadLocalStorage("igdb_token");
-		await this.refreshIGDBToken();
+		this.token = this.app.loadLocalStorage(TOKEN_KEY);
+		const expiryRaw = this.app.loadLocalStorage(TOKEN_EXPIRY_KEY);
+		this.tokenExpiry = expiryRaw ? (parseInt(expiryRaw, 10) || 0) : 0;
 
 		this.app.workspace.onLayoutReady(async () => {
 			await this.refreshAllIGDBNotes();
@@ -115,9 +201,25 @@ export default class IGDBSync extends Plugin {
 
 		this.addCommand({
 			id: 'force-igdb-sync',
-			name: 'Sync note properties with IGDB',
+			name: 'Sync all IGDB notes',
 			callback: () => {
 				this.refreshAllIGDBNotes();
+			}
+		});
+
+		this.addCommand({
+			id: 'sync-current-igdb-note',
+			name: 'Sync IGDB properties for current note',
+			editorCheckCallback: (checking, _, view) => {
+				const file = view.file;
+				if (!file || file.extension !== 'md') return false;
+				const fm = this.app.metadataCache.getFileCache(file)?.frontmatter ?? {};
+				const igdb = fm["igdb"];
+				if (!igdb) return false;
+				if (!checking) {
+					this.refreshIGDBNote(file, igdb);
+				}
+				return true;
 			}
 		});
 
@@ -163,7 +265,6 @@ export default class IGDBSync extends Plugin {
 			}
 		})
 
-		// This adds a settings tab so the user can configure various aspects of the plugin
 		this.addSettingTab(new IGDBSyncSettingsTab(this.app, this));
 	}
 
@@ -177,17 +278,45 @@ export default class IGDBSync extends Plugin {
 
 	async saveSettings() {
 		await this.saveData(this.settings);
-		await this.refreshIGDBToken();
+		this.tokenExpiry = 0;
+		await this.ensureValidToken();
 	}
 
-	async refreshIGDBToken() {
-		if (this.settings.clientId && this.settings.secret) {
-			const tokenResponse = await refreshIGDBToken(this.settings.clientId, this.settings.secret);
-			this.token = tokenResponse.access_token;
-			this.app.saveLocalStorage("igdb_token", tokenResponse.access_token);
-		} else {
+	async ensureValidToken(): Promise<string | null> {
+		if (this.token && Date.now() < this.tokenExpiry - TOKEN_REFRESH_BUFFER_MS) {
+			return this.token;
+		}
+		if (!this.settings.clientId || !this.settings.secret) {
 			this.token = null;
-			this.app.saveLocalStorage("igdb_token", null);
+			this.tokenExpiry = 0;
+			this.app.saveLocalStorage(TOKEN_KEY, null);
+			this.app.saveLocalStorage(TOKEN_EXPIRY_KEY, null);
+			return null;
+		}
+		try {
+			const tokenResponse = await fetchIGDBToken(this.settings.clientId, this.settings.secret);
+			this.token = tokenResponse.access_token;
+			this.tokenExpiry = Date.now() + tokenResponse.expires_in * 1000;
+			this.app.saveLocalStorage(TOKEN_KEY, this.token);
+			this.app.saveLocalStorage(TOKEN_EXPIRY_KEY, String(this.tokenExpiry));
+			return this.token;
+		} catch (e) {
+			new Notice(`${PLUGIN_NAME}: token refresh failed (${e.message ?? e})`);
+			return null;
+		}
+	}
+
+	async fetchGamesWithRetry(ids: number[]): Promise<IGDBGame[]> {
+		let token = await this.ensureValidToken();
+		if (!token) throw new Error("no IGDB token available");
+		try {
+			return await fetchIGDBGames(token, this.settings.clientId, ids);
+		} catch (e) {
+			if (!(e instanceof IGDBAuthError)) throw e;
+			this.tokenExpiry = 0;
+			token = await this.ensureValidToken();
+			if (!token) throw e;
+			return await fetchIGDBGames(token, this.settings.clientId, ids);
 		}
 	}
 
@@ -195,12 +324,33 @@ export default class IGDBSync extends Plugin {
 		if (this.syncing) return;
 		this.syncing = true;
 		try {
+			const fileToId = new Map<TFile, number>();
 			for (const file of this.app.vault.getMarkdownFiles()) {
 				const fm = this.app.metadataCache.getFileCache(file)?.frontmatter ?? {};
-				const igdb = fm?.["igdb"]
-				if (igdb) {
-					await this.refreshIGDBNote(file, igdb);
-				}
+				const igdb = fm["igdb"];
+				if (igdb) fileToId.set(file, igdb);
+			}
+			if (fileToId.size === 0) return;
+
+			const ids = Array.from(new Set(fileToId.values()));
+			let games: IGDBGame[];
+			try {
+				games = await this.fetchGamesWithRetry(ids);
+			} catch (e) {
+				new Notice(`${PLUGIN_NAME}: sync failed (${e.message ?? e})`);
+				return;
+			}
+			const gameById = new Map(games.map(g => [g.id, g]));
+
+			let missing = 0;
+			for (const [file, id] of fileToId) {
+				const game = gameById.get(id);
+				if (!game) { missing++; continue; }
+				await this.applyGameData(file, game);
+			}
+
+			if (missing > 0) {
+				new Notice(`${PLUGIN_NAME}: ${missing} note(s) had no matching IGDB game`);
 			}
 		} finally {
 			this.syncing = false;
@@ -208,16 +358,29 @@ export default class IGDBSync extends Plugin {
 	}
 
 	async refreshIGDBNote(file: TFile, igdb: number) {
-		const token = this.token;
-		if (token) {
-			const { releaseDate, storeLink } = await fetchIGDBGameInfo(token, this.settings.clientId, igdb)
-			this.app.fileManager.processFrontMatter(file, fm => {
-				fm["release_date"] = releaseDate ?? "TBD"
-				if (storeLink != null) {
-					fm["store_link"] = storeLink
-				}
-			})
+		let games: IGDBGame[];
+		try {
+			games = await this.fetchGamesWithRetry([igdb]);
+		} catch (e) {
+			new Notice(`${PLUGIN_NAME}: sync failed (${e.message ?? e})`);
+			return;
 		}
+		const game = games[0];
+		if (!game) {
+			new Notice(`${PLUGIN_NAME}: game ${igdb} not found`);
+			return;
+		}
+		await this.applyGameData(file, game);
+	}
+
+	private async applyGameData(file: TFile, game: IGDBGame) {
+		const data = extractIGDBNoteData(game);
+		await this.app.fileManager.processFrontMatter(file, fm => {
+			fm["release_date"] = data.releaseDate ?? "TBD";
+			if (data.storeLink != null) fm["store_link"] = data.storeLink;
+			if (data.coverUrl != null) fm["cover_url"] = data.coverUrl;
+			if (data.platforms.length > 0) fm["platforms"] = data.platforms;
+		});
 	}
 }
 
@@ -229,25 +392,41 @@ interface GameResult {
 }
 
 class GameSearchModal extends SuggestModal<GameResult> {
+	private debounceTimer?: number;
+
 	constructor(app: App, private plugin: IGDBSync, private callback: (result: GameResult) => void) {
 		super(app);
 	}
-	// Returns all available suggestions.
-	async getSuggestions(query: string): Promise<GameResult[]> {
-		if (!this.plugin.token || !this.plugin.settings.clientId) {
-			return [];
-		}
-		const results = await searchIGDBGames(this.plugin.token, this.plugin.settings.clientId, query);
-		return results
+
+	getSuggestions(query: string): Promise<GameResult[]> {
+		return new Promise((resolve) => {
+			window.clearTimeout(this.debounceTimer);
+			this.debounceTimer = window.setTimeout(async () => {
+				if (!this.plugin.settings.clientId) {
+					resolve([]);
+					return;
+				}
+				const token = await this.plugin.ensureValidToken();
+				if (!token) {
+					resolve([]);
+					return;
+				}
+				try {
+					const results = await searchIGDBGames(token, this.plugin.settings.clientId, query);
+					resolve(results);
+				} catch (e) {
+					new Notice(`${PLUGIN_NAME}: search failed (${e.message ?? e})`);
+					resolve([]);
+				}
+			}, SEARCH_DEBOUNCE_MS);
+		});
 	}
 
-	// Renders each suggestion item.
 	renderSuggestion(game: GameResult, el: HTMLElement) {
 		el.createEl('div', { text: game.name });
 		el.createEl('small', { text: `${game.developer} (${game.year})` });
 	}
 
-	// Perform action on the selected suggestion.
 	onChooseSuggestion(game: GameResult, evt: MouseEvent | KeyboardEvent) {
 		this.callback(game);
 	}
